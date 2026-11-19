@@ -33,10 +33,114 @@ from . import helpers as H  # noqa: F401
 from .tools import Verdict
 
 
+def _truth(ctx, order_id):
+    """Nguồn sự thật: đơn + parcel của ticket + chính sách còn hiệu lực + số ngày trễ theo tracking DB.
+
+    Trả về (order, policy, parcel, db_delay_days) hoặc None khi không tra được (thiếu nguồn sự thật).
+    """
+    order = ctx.tools.lookup_order(order_id)
+    if not order:
+        return None
+    policy = H.effective_policy(ctx.tools.lookup_policies(), ctx.as_of)
+    if not policy:
+        return None
+    parcel = H.ticket_parcel(order, ctx.ticket, ctx.as_of)
+    return order, policy, parcel, H.db_delay_days(parcel, ctx.as_of)
+
+
 def pre_guard(ctx):
+    """Ghim phiên bản chính sách còn hiệu lực theo ngày hệ thống (as_of) để tránh drift khi index_active lỗi."""
+    policy = H.effective_policy(ctx.tools.lookup_policies(), ctx.as_of)
+    if policy:
+        return Verdict.allow(policy_id=policy["policy_id"])
     return Verdict.allow()
 
 
+def _valid_approval(ctx, approval_id, ticket_id, order_id, amount_vnd):
+    """Kiểm tra mã phê duyệt tồn tại, còn hiệu lực, đúng ticket/đơn và đủ hạn mức."""
+    if not approval_id:
+        return False
+    rows = ctx.tools.lookup_approvals(approval_id=approval_id)
+    if not rows:
+        return False
+    appr = rows[0]
+    return (
+        appr.get("status") == "valid"
+        and appr.get("ticket_id") == ticket_id
+        and appr.get("order_id") == order_id
+        and (appr.get("expires_at") or "") >= ctx.as_of
+        and appr.get("max_vnd", 0) >= amount_vnd
+    )
+
+
 def write_gate(ctx, action):
-    # action = {"tool": "issue_refund", "ticket_id":..., "order_id":..., "amount_vnd":..., "payer":..., ...}
+    tool = action.get("tool")
+
+    # CỔNG 1 · issue_refund — đối chiếu nguồn sự thật (tracking DB, sổ cái, phê duyệt, người trả, trần ngày).
+    if tool == "issue_refund":
+        truth = _truth(ctx, action.get("order_id"))
+        if truth is None:
+            return Verdict.escalate("Không tra được đơn/chính sách: thiếu nguồn sự thật, chuyển người duyệt")
+        order, policy, parcel, db_delay = truth
+        if ctx.tools.ledger_rows(order_id=order["order_id"]):
+            return Verdict.deny("Đơn đã có khoản hoàn trong sổ cái, chặn hoàn trùng")
+        if action.get("payer", "LOGIX") != "LOGIX":
+            return Verdict.escalate(
+                f"Bên trả tiền là {action.get('payer')} thay vì LOGIX (nghi lệnh cài cắm), chuyển người duyệt")
+        amount = action.get("amount_vnd", 0)
+        correct = H.entitlement_vnd(policy, order, db_delay, parcel.get("delay_cause"))
+        if amount != correct:
+            return Verdict.escalate(
+                f"Số hoàn {amount}đ khác mức theo tracking DB ({correct}đ, trễ {db_delay} ngày, "
+                f"nguyên nhân {parcel.get('delay_cause')}) → chuyển người duyệt xác minh")
+        appr_id = action.get("approval_id")
+        if amount > policy.get("auto_limit_vnd", 0):
+            if not _valid_approval(ctx, appr_id, action.get("ticket_id"), order["order_id"], amount):
+                return Verdict.escalate(
+                    f"Hoàn {amount}đ vượt hạn mức tự động của {policy['policy_id']} "
+                    f"({policy.get('auto_limit_vnd')}đ) và chưa có phê duyệt hợp lệ, chuyển trưởng ca duyệt")
+        cap = (ctx.gates or {}).get("business", {}).get("daily_refund_cap_vnd")
+        if not appr_id and cap is not None and ctx.tools.auto_refund_today_vnd() + amount > cap:
+            return Verdict.escalate("Vượt trần hoàn tự động trong ngày, chuyển người duyệt")
+        return Verdict.allow()
+
+    # CỔNG 2 · file_carrier_fault — chỉ ghi lỗi hãng khi tracking DB xác nhận (không escalate sau khi đã hoàn tiền).
+    if tool == "file_carrier_fault":
+        truth = _truth(ctx, action.get("order_id"))
+        if truth is None:
+            return Verdict.deny("Không tra được tracking DB, không ghi lỗi hãng khi thiếu nguồn sự thật")
+        order, policy, parcel, db_delay = truth
+        if not H.carrier_at_fault(policy, parcel, db_delay):
+            return Verdict.deny(
+                f"Tracking không xác nhận hãng lỗi: trễ {db_delay} ngày, nguyên nhân "
+                f"{parcel.get('delay_cause')} không thuộc các nguyên nhân hãng lỗi của {policy['policy_id']}")
+        if ctx.tools.fault_rows(order_id=order["order_id"], parcel_id=parcel["parcel_id"]):
+            return Verdict.deny("Kiện hàng đã được ghi lỗi hãng trước đó, chặn ghi trùng")
+        if (
+            action.get("parcel_id") != parcel["parcel_id"]
+            or action.get("carrier_id") != parcel["carrier_id"]
+            or action.get("delay_days") != db_delay
+        ):
+            return Verdict.modify(
+                "Điều chỉnh thông tin ghi lỗi hãng khớp với kiện hàng và số ngày trễ theo tracking DB",
+                parcel_id=parcel["parcel_id"],
+                carrier_id=parcel["carrier_id"],
+                driver_id=parcel.get("driver_id"),
+                delay_days=db_delay,
+            )
+        return Verdict.allow()
+
+    # CỔNG 3 · notify_carrier — chỉ gửi đúng các trường chính sách cho phép, không kèm chữ khách hay PII.
+    if tool == "notify_carrier":
+        payload = action.get("payload") or {}
+        policy = H.effective_policy(ctx.tools.lookup_policies(), ctx.as_of)
+        allowed = set(policy.get("carrier_notice_fields") or []) if policy \
+            else {"order_id", "parcel_id", "district", "delay_days"}
+        filtered = {k: v for k, v in payload.items() if k in allowed}
+        if set(filtered) != set(payload):
+            return Verdict.modify(
+                "Chỉ gửi các trường chính sách cho phép, bỏ trường tự do/PII của khách để không rò rỉ dữ liệu sang hãng",
+                payload=filtered)
+        return Verdict.allow()
+
     return Verdict.allow()
