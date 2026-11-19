@@ -1,12 +1,17 @@
 {
-  "team": "",
-  "members": [],
-  "incident": "",
-  "decision_v1": "",
-  "decision_v2": "",
+  "team": "K5-L3B-DAY10-X-PoCtoPilotGate1",
+  "members": [
+    "PhamThanhAn-2A202603913",
+    "CungDucAnh-2A202603814",
+    "DoQuocKhanh-2A202603823",
+    "MaiLeBaVuong-2A202603872"
+  ],
+  "incident": "S1",
+  "decision_v1": "Tiếp tục",
+  "decision_v2": "Tiếp tục",
   "three_lines": {
-    "environment_assumption": "",
-    "reduce_or_prevent": "",
-    "measure_in_pilot": ""
+    "environment_assumption": "Tracking DB cập nhật status, delivered_date và delay_cause đầy đủ, đồng bộ, gần thời gian thực; trong thực tế điểm phát có thể quét bù trễ hoặc ghi dữ liệu đủ trường nhưng stale.",
+    "reduce_or_prevent": "Gate ngăn các write tự động có tracking thiếu đã nhận diện và strike tự động vượt 2/hãng/ngày; toàn hệ thống chỉ giảm rủi ro, chưa bảo đảm hết tác hại vì stale-but-complete data, cách viết chưa nhận diện và quy trình duyệt ngoại lệ chưa tích hợp.",
+    "measure_in_pilot": "Đo freshness và sai lệch tracking so với scan gốc, tỉ lệ thiếu ngày/cause và sửa tay, tranh chấp lỗi hãng, số strike thực theo 24 giờ, cùng cost/ROI, queue SLA và PII audit trên dữ liệu thật."
   }
 }

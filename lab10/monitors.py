@@ -27,8 +27,28 @@ def model_override_rate(trials):
     ) / max(1, len(trials))
 
 
+def tracking_data_incomplete_rate(trials):
+    """Fraction of tickets whose automatic write hit incomplete tracking data."""
+    return sum(
+        any(e.get("type") == "guard" and e.get("kind") == "tracking_data_incomplete"
+            for e in (t.get("events") or []))
+        for t in trials
+    ) / max(1, len(trials))
+
+
+def carrier_strike_limit_block_rate(trials):
+    """Fraction of tickets where the per-carrier daily automatic strike ceiling blocked a write."""
+    return sum(
+        any(e.get("type") == "guard" and e.get("kind") == "carrier_strike_limit"
+            for e in (t.get("events") or []))
+        for t in trials
+    ) / max(1, len(trials))
+
+
 MONITORS = {
     "escalation_rate": escalation_rate,     # có sẵn; KHÔNG tính là metric mới của đội
     "model_override_rate": model_override_rate,
+    "tracking_data_incomplete_rate": tracking_data_incomplete_rate,
+    "carrier_strike_limit_block_rate": carrier_strike_limit_block_rate,
 }
 STARTER_MONITORS = ("escalation_rate",)

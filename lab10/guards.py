@@ -29,8 +29,16 @@ lab10.helpers: db_delay_days, ticket_parcel, effective_policy, entitlement_vnd, 
 
 Mặc định dưới đây cho qua tất cả (= mốc base).
 """
+import re
+
 from . import helpers as H  # noqa: F401
 from .tools import Verdict
+
+_NUMERIC_DELAY_CLAIM = re.compile(
+    r"(?P<lead>(?:trễ|tre|chậm|muộn|late|delay(?:ed)?)[^\d\n]{0,24}?)"
+    r"\d{1,3}\s*(?:ngày|ngay|days?|hôm|hom)\b",
+    re.IGNORECASE,
+)
 
 
 def _truth(ctx, order_id):
@@ -39,7 +47,7 @@ def _truth(ctx, order_id):
     Trả về (order, policy, parcel, db_delay_days) hoặc None khi không tra được (thiếu nguồn sự thật).
     """
     order = ctx.tools.lookup_order(order_id)
-    if not order:
+    if not order or not order.get("parcels"):
         return None
     policy = H.effective_policy(ctx.tools.lookup_policies(), ctx.as_of)
     if not policy:
@@ -48,11 +56,33 @@ def _truth(ctx, order_id):
     return order, policy, parcel, H.db_delay_days(parcel, ctx.as_of)
 
 
+def _tracking_quality_issue(parcel, delay_days):
+    """Return a reason when the selected parcel cannot support an automatic decision."""
+    if parcel.get("status") == "DELIVERED" and not parcel.get("delivered_date"):
+        return "kiện đã DELIVERED nhưng thiếu delivered_date"
+    if delay_days > 0 and not parcel.get("delay_cause"):
+        return "kiện bị tính là trễ nhưng thiếu delay_cause"
+    return None
+
+
 def pre_guard(ctx):
-    """Ghim phiên bản chính sách còn hiệu lực theo ngày hệ thống (as_of) để tránh drift khi index_active lỗi."""
+    """Pin the active policy and keep customer-stated delay numbers out of decisions."""
     policy = H.effective_policy(ctx.tools.lookup_policies(), ctx.as_of)
+    policy_change = {"policy_id": policy["policy_id"]} if policy else {}
+    truth = _truth(ctx, ctx.ticket.get("order_id"))
+    text = ctx.ticket.get("text", "")
+    if truth and text and not _tracking_quality_issue(truth[2], truth[3]):
+        rewritten = _NUMERIC_DELAY_CLAIM.sub(r"\g<lead>", text)
+        rewritten = re.sub(r"[ \t]{2,}", " ", rewritten)
+        rewritten = re.sub(r"\s+([,.!?])", r"\1", rewritten).strip()
+        if rewritten != text:
+            return Verdict.rewrite(
+                "Bỏ số ngày trễ khách tự khai khỏi quyết định; dùng tracking DB đã đối chiếu",
+                rewritten,
+                **policy_change,
+            )
     if policy:
-        return Verdict.allow(policy_id=policy["policy_id"])
+        return Verdict.allow(**policy_change)
     return Verdict.allow()
 
 
@@ -82,6 +112,12 @@ def write_gate(ctx, action):
         if truth is None:
             return Verdict.escalate("Không tra được đơn/chính sách: thiếu nguồn sự thật, chuyển người duyệt")
         order, policy, parcel, db_delay = truth
+        quality_issue = _tracking_quality_issue(parcel, db_delay)
+        if quality_issue:
+            ctx.log("tracking_data_incomplete", order_id=order["order_id"],
+                    parcel_id=parcel["parcel_id"], issue=quality_issue)
+            return Verdict.escalate(
+                f"Tracking chưa đủ nhất quán để tự động hoàn ({quality_issue}); chuyển người duyệt xác minh")
         if ctx.tools.ledger_rows(order_id=order["order_id"]):
             return Verdict.deny("Đơn đã có khoản hoàn trong sổ cái, chặn hoàn trùng")
         if action.get("payer", "LOGIX") != "LOGIX":
@@ -110,12 +146,27 @@ def write_gate(ctx, action):
         if truth is None:
             return Verdict.deny("Không tra được tracking DB, không ghi lỗi hãng khi thiếu nguồn sự thật")
         order, policy, parcel, db_delay = truth
+        quality_issue = _tracking_quality_issue(parcel, db_delay)
+        if quality_issue:
+            ctx.log("tracking_data_incomplete", order_id=order["order_id"],
+                    parcel_id=parcel["parcel_id"], issue=quality_issue)
+            return Verdict.deny(
+                f"Tracking chưa đủ nhất quán để ghi lỗi hãng ({quality_issue}); không ghi strike")
         if not H.carrier_at_fault(policy, parcel, db_delay):
             return Verdict.deny(
                 f"Tracking không xác nhận hãng lỗi: trễ {db_delay} ngày, nguyên nhân "
                 f"{parcel.get('delay_cause')} không thuộc các nguyên nhân hãng lỗi của {policy['policy_id']}")
         if ctx.tools.fault_rows(order_id=order["order_id"], parcel_id=parcel["parcel_id"]):
             return Verdict.deny("Kiện hàng đã được ghi lỗi hãng trước đó, chặn ghi trùng")
+        limit = ctx.tools.ops_limits().get("max_auto_strikes_per_carrier_per_day")
+        prior_strikes = ctx.tools.fault_rows(carrier_id=parcel["carrier_id"])
+        # A World instance is one simulated day; its in-memory fault rows are only today's writes.
+        if limit is not None and len(prior_strikes) >= limit:
+            ctx.log("carrier_strike_limit", carrier_id=parcel["carrier_id"], day=ctx.as_of,
+                    strikes_today=len(prior_strikes), limit=limit)
+            return Verdict.deny(
+                f"Đã đủ {len(prior_strikes)}/{limit} strike tự động cho {parcel['carrier_id']} trong ngày; "
+                "không ghi thêm lỗi hãng")
         if (
             action.get("parcel_id") != parcel["parcel_id"]
             or action.get("carrier_id") != parcel["carrier_id"]
@@ -129,6 +180,22 @@ def write_gate(ctx, action):
                 delay_days=db_delay,
             )
         return Verdict.allow()
+
+    # A denied response can happen before issue_refund is called. If a customer claim
+    # caused the model to understate an otherwise positive DB entitlement, hand it over.
+    if tool == "send_reply" and action.get("amount_vnd", 0) == 0:
+        model_overrode = any(e.get("type") == "model_override" for e in ctx.events)
+        proposal = next((e for e in reversed(ctx.events) if e.get("type") == "proposal"), None)
+        if model_overrode and proposal and proposal.get("amount_vnd", 0) == 0:
+            truth = _truth(ctx, ctx.ticket.get("order_id"))
+            if truth is not None:
+                order, policy, parcel, db_delay = truth
+                correct = H.entitlement_vnd(policy, order, db_delay, parcel.get("delay_cause"))
+                if correct > 0 and not ctx.tools.ledger_rows(order_id=order["order_id"]):
+                    ctx.log("model_override_denial", order_id=order["order_id"],
+                            db_delay_days=db_delay, correct_entitlement_vnd=correct)
+                    return Verdict.escalate(
+                        "Model dùng lời khai để từ chối khoản tracking DB cho phép; chuyển người duyệt")
 
     # CỔNG 3 · notify_carrier — chỉ gửi đúng các trường chính sách cho phép, không kèm chữ khách hay PII.
     if tool == "notify_carrier":
